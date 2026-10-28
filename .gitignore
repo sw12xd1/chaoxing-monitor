@@ -1,0 +1,26 @@
+# 本地配置：含你的 Cookie / PushPlus token，绝不要提交
+config.json
+
+# 运行时产物
+state.json
+monitor.log
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+
+# 调试截图
+probe_*.png
+test_card.png
+
+# WorkBuddy 项目笔记（含本地环境信息）
+.workbuddy/
