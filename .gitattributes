@@ -1,0 +1,9 @@
+# 批处理必须保持 CRLF，否则 cmd.exe 解析会出现丢字符、闪退
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 其余文本统一 LF
+*.py   text eol=lf
+*.md   text eol=lf
+*.json text eol=lf
+*.txt  text eol=lf
