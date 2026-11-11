@@ -77,6 +77,15 @@ AES_KEY = b"u2oh6Vu^HWe4_AES"          # 学习通登录参数加密密钥（key
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
 
+
+class CookieInvalid(Exception):
+    """Cookie 失效：接口返回「请重新登录」或直接返回登录页 HTML。
+
+    单独定义成一个异常，是为了不把它和网络抖动混为一谈——
+    Cookie 失效必须**立刻大声报警**，否则程序会静默空转、看起来一切正常。
+    """
+
+
 # otherId -> 签到类型说明
 SIGN_TYPES = {
     0: "普通/拍照签到",
@@ -100,6 +109,7 @@ DEFAULT_CONFIG = {
     "sign_interval": 30,
     "notice_interval": 180,
     "heartbeat_interval": 300,
+    "course_refresh": 1800,
     "sign_workers": 4,
     "popup": True,
     "popup_seconds": 30,
@@ -524,13 +534,30 @@ class Chaoxing:
         self.uid, self.fid = get_identity(session)
         self.name = ""
         self._courses = None
+        self._courses_at = 0.0        # 课程缓存时间戳（用于定期刷新）
 
     # ---------- 课程 ----------
     def courses(self, refresh=False):
         if self._courses is not None and not refresh:
             return self._courses
         r = self.s.get(URL_COURSES, params={"rss": "1", "view": "json"}, timeout=20)
-        data = r.json()
+
+        # Cookie 失效时，这个接口不会返回 401，而是返回登录页 HTML 或
+        # {"result":0,"msg":"请重新登录"}。以前这里直接 .json() 解析，
+        # channelList 取不到就静默变成 0 门课 —— 程序看似正常，实际瞎了。
+        ctype = (r.headers.get("Content-Type") or "").lower()
+        if "html" in ctype:
+            raise CookieInvalid("课程接口返回了登录页 HTML，登录态已失效")
+        try:
+            data = r.json()
+        except Exception:
+            raise CookieInvalid(
+                f"课程接口返回内容无法解析为 JSON（HTTP {r.status_code}，"
+                f"前 60 字：{r.text[:60]!r}）")
+        if data.get("status") is False or "channelList" not in data:
+            msg = data.get("msg") or data.get("errorMsg") or "接口未返回课程列表"
+            raise CookieInvalid(f"课程接口提示：{msg}")
+
         out, seen = [], set()
         for ch in data.get("channelList", []):
             content = ch.get("content") or {}
@@ -553,14 +580,20 @@ class Chaoxing:
             out = [c for c in out
                    if any(k in (c["courseName"] + c["className"]) for k in flt)]
         self._courses = out
+        self._courses_at = time.time()
         return out
 
     # ---------- 签到检测 ----------
     def check_activity(self, course_id: str, class_id: str):
         url = (f"{URL_ACTIVELIST}?fid=0&courseId={course_id}&classId={class_id}"
                f"&_={int(time.time() * 1000)}")
+        r = self.s.get(url, timeout=15)
+        # 未登录时这个接口会返回登录页 HTML，而不是 401。
+        # 必须显式判定，否则会被当成「这门课没签到」而静默跳过。
+        if "html" in (r.headers.get("Content-Type") or "").lower():
+            raise CookieInvalid("签到接口返回登录页 HTML，登录态已失效")
         try:
-            j = self.s.get(url, timeout=15).json()
+            j = r.json()
         except Exception:
             return None
         d = j.get("data") if isinstance(j.get("data"), dict) else j
@@ -733,6 +766,10 @@ class Monitor:
         self.webhook = cfg.get("webhook_url") or ""
         self.session = build_session(cfg)
         self.cx = Chaoxing(self.session, cfg)
+        self._alerted_cookie = False      # 是否已就 Cookie 失效报过警
+        self._last_cookie_alert = 0.0     # 上次报警时间（节流用）
+        self._course_count = -1           # 最近一次成功拿到的课程数
+        self._course_refresh = max(300, int(cfg.get("course_refresh", 1800) or 1800))
         self._init_user()
 
     def _init_user(self):
@@ -765,31 +802,95 @@ class Monitor:
             webhook_send(self.webhook, title, push_content or text)
 
     # ---------- 签到 ----------
+    def _cookie_alert(self, err):
+        """Cookie 失效 / 课程为 0 时必须报警。
+
+        这是最重要的一条防线：Cookie 一失效，课程列表就变空，
+        程序会「心跳正常、轮数照涨、但一门课都没扫」——用户以为在监控，
+        实际早就瞎了。所以这里必须主动喊出来。
+        节流：首次立即报，之后每 30 分钟重复，避免每轮都弹窗。
+        """
+        now = time.time()
+        first = not self._alerted_cookie
+        if not first and now - self._last_cookie_alert < 1800:
+            return
+        self._alerted_cookie = True
+        self._last_cookie_alert = now
+        self._course_count = 0
+        tail = "" if first else "\n\n（此提醒每 30 分钟重复一次，直到恢复为止）"
+        self.alert(
+            "⚠ Cookie 已失效，监控已停摆",
+            f"{err}\n\n"
+            f"程序还在定时轮询，但一门课都拿不到，"
+            f"所以现在不会提醒任何签到。\n\n"
+            f"怎么修：浏览器重新登录 i.chaoxing.com → F12 → 复制 Cookie → "
+            f"粘贴进 config.json 的 cookie 字段 → 重启程序。{tail}",
+            "error",
+            push_content=(f"<b>Cookie 已失效，监控已停摆</b><br>{err}<br><br>"
+                          f"请重新复制 Cookie 到 config.json 后重启程序。"))
+
+    def _clear_cookie_alert(self, n: int):
+        """课程恢复正常，若之前报过警则记一条恢复日志。"""
+        self._course_count = n
+        if self._alerted_cookie:
+            self._alerted_cookie = False
+            self._last_cookie_alert = 0.0
+            log(f"[√] Cookie 已恢复，当前监控 {n} 门课程")
+
     def _scan_activities(self, courses):
-        """并发扫描所有课程的签到活动（sign_workers=1 时退化为顺序+抖动）。"""
+        """并发扫描所有课程的签到活动（sign_workers=1 时退化为顺序+抖动）。
+
+        每门课单独捕获异常：单门课网络抖动不该拖垮整轮；
+        但如果**所有**课都报登录失效，说明 Cookie 废了，向上抛出。
+        """
+        def one(c):
+            try:
+                return c, self.cx.check_activity(c["courseId"], c["classId"]), None
+            except CookieInvalid as e:
+                return c, None, e
+            except Exception:
+                return c, None, None
+
         workers = max(1, int(self.cfg.get("sign_workers", 4) or 1))
         if workers > 1:
             from concurrent.futures import ThreadPoolExecutor
             with ThreadPoolExecutor(max_workers=workers) as ex:
-                return list(ex.map(
-                    lambda c: (c, self.cx.check_activity(c["courseId"], c["classId"])),
-                    courses))
-        out = []
-        for c in courses:
-            out.append((c, self.cx.check_activity(c["courseId"], c["classId"])))
-            time.sleep(random.uniform(0.4, 1.2))    # 顺序模式加抖动，降低风控
-        return out
+                rows = list(ex.map(one, courses))
+        else:
+            rows = []
+            for c in courses:
+                rows.append(one(c))
+                time.sleep(random.uniform(0.4, 1.2))    # 顺序模式加抖动，降低风控
+
+        errs = [e for _c, _a, e in rows if e is not None]
+        if errs and len(errs) == len(rows):
+            raise errs[0]
+        return [(c, a) for c, a, _e in rows]
 
     def check_signs(self):
+        # 课程列表定期刷新：既能看到中途新选的课，也能及时发现 Cookie 失效
+        # （否则一直吃缓存，永远发现不了登录态掉了）
+        stale = (time.time() - getattr(self.cx, "_courses_at", 0)) > self._course_refresh
         try:
-            courses = self.cx.courses()
+            courses = self.cx.courses(refresh=stale)
+        except CookieInvalid as e:
+            self._cookie_alert(e)
+            return
         except Exception as e:
-            log(f"[!] 获取课程列表失败（Cookie 可能已失效）: {e}")
+            log(f"[!] 获取课程列表失败（可能是网络问题）: {e}")
             return
         if not courses:
+            self._cookie_alert(CookieInvalid(
+                "接口调用成功，但返回 0 门课程"
+                "（如果填了 course_filter，请检查关键词是否写错）"))
             return
+        self._clear_cookie_alert(len(courses))
         t0 = time.time()
-        results = self._scan_activities(courses)
+        try:
+            results = self._scan_activities(courses)
+        except CookieInvalid as e:
+            self._cookie_alert(e)
+            return
         cost = time.time() - t0
         if cost > max(10, int(self.cfg.get("sign_interval", 30))):
             log(f"[!] 扫描 {len(courses)} 门课耗时 {cost:.1f}s，已超过轮询间隔，"
@@ -896,6 +997,22 @@ class Monitor:
             f"{'关' if not (self.push_token or self.webhook) else ''}")
         log("=" * 60)
         log("[i] 提醒：别关这个窗口，也别在窗口里用鼠标拖选文字（会卡死程序）")
+
+        # 启动自检：拿不到课程就等于没在工作，必须当场说清楚，别等用户自己发现
+        try:
+            n0 = len(self.cx.courses())
+            self._course_count = n0
+            if n0:
+                log(f"[i] 启动自检通过：已加载 {n0} 门课程")
+            else:
+                self._cookie_alert(CookieInvalid(
+                    "启动自检：接口返回 0 门课程"
+                    "（如果填了 course_filter，请检查关键词是否过滤掉了全部）"))
+        except CookieInvalid as e:
+            self._cookie_alert(e)
+        except Exception as e:
+            log(f"[!] 启动自检失败（可能是网络问题）: {e}")
+
         last_notice = 0.0
         started = time.time()
         last_hb = started
@@ -913,7 +1030,14 @@ class Monitor:
                 rounds += 1
                 if time.time() - last_hb >= hb:
                     mins = int((time.time() - started) / 60)
-                    log(f"[i] 心跳：已连续运行 {mins} 分钟，完成 {rounds} 轮扫描（正常）")
+                    n = self._course_count
+                    if n > 0:
+                        log(f"[i] 心跳：已连续运行 {mins} 分钟，完成 {rounds} 轮扫描，"
+                            f"监控 {n} 门课（正常）")
+                    else:
+                        log(f"[!] 心跳：已连续运行 {mins} 分钟，完成 {rounds} 轮扫描，"
+                            f"⚠ 监控 0 门课 —— Cookie 大概率已失效，"
+                            f"当前不会提醒任何签到！")
                     last_hb = time.time()
             except KeyboardInterrupt:
                 log("[i] 已手动退出")
