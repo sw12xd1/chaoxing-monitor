@@ -542,18 +542,16 @@ class Chaoxing:
             return self._courses
         r = self.s.get(URL_COURSES, params={"rss": "1", "view": "json"}, timeout=20)
 
-        # Cookie 失效时，这个接口不会返回 401，而是返回登录页 HTML 或
-        # {"result":0,"msg":"请重新登录"}。以前这里直接 .json() 解析，
-        # channelList 取不到就静默变成 0 门课 —— 程序看似正常，实际瞎了。
-        ctype = (r.headers.get("Content-Type") or "").lower()
-        if "html" in ctype:
-            raise CookieInvalid("课程接口返回了登录页 HTML，登录态已失效")
+        # 判断登录态只能看「解析出来的内容」，绝不能看 Content-Type：
+        # 这个接口正常返回 JSON 时，Content-Type 同样是 text/html;charset=UTF-8。
+        # 登录失效时会出现两种情况：返回登录页 HTML（解析 JSON 失败），
+        # 或返回 {"result":0,"msg":"请重新登录"}（无 channelList）。
         try:
             data = r.json()
         except Exception:
             raise CookieInvalid(
-                f"课程接口返回内容无法解析为 JSON（HTTP {r.status_code}，"
-                f"前 60 字：{r.text[:60]!r}）")
+                f"课程接口返回的不是 JSON，登录态大概已失效"
+                f"（前 80 字：{r.text[:80]!r}）")
         if data.get("status") is False or "channelList" not in data:
             msg = data.get("msg") or data.get("errorMsg") or "接口未返回课程列表"
             raise CookieInvalid(f"课程接口提示：{msg}")
@@ -588,13 +586,14 @@ class Chaoxing:
         url = (f"{URL_ACTIVELIST}?fid=0&courseId={course_id}&classId={class_id}"
                f"&_={int(time.time() * 1000)}")
         r = self.s.get(url, timeout=15)
-        # 未登录时这个接口会返回登录页 HTML，而不是 401。
-        # 必须显式判定，否则会被当成「这门课没签到」而静默跳过。
-        if "html" in (r.headers.get("Content-Type") or "").lower():
-            raise CookieInvalid("签到接口返回登录页 HTML，登录态已失效")
+        # 同样不能看 Content-Type（正常时也是 text/html）。
+        # 能解析成 JSON 就说明拿到了数据；解析失败且内容像登录页，才判定失效。
         try:
             j = r.json()
         except Exception:
+            head = r.text[:400]
+            if "<html" in head.lower() or "用户登录" in head or "请重新登录" in head:
+                raise CookieInvalid("签到接口返回登录页 HTML，登录态已失效")
             return None
         d = j.get("data") if isinstance(j.get("data"), dict) else j
         lst = (d or {}).get("activeList") or []
@@ -1051,7 +1050,12 @@ class Monitor:
             self.check_signs()
         if self.cfg.get("monitor_notice", True):
             self.check_notices()
-        log("[i] 单次检测完成")
+        n = max(self._course_count, 0)
+        if n > 0:
+            log(f"[i] 单次检测完成：本次扫描了 {n} 门课程")
+        else:
+            log("[!] 单次检测完成，但一门课都没扫到 —— Cookie 不可用，"
+                "程序无法监控任何签到")
 
 
 # ----------------------------------------------------------------------------
