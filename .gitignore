@@ -22,5 +22,8 @@ Thumbs.db
 probe_*.png
 test_card.png
 
+# 快捷方式：含本机绝对路径，换机器会失效，用 README 里的方法重新生成
+*.lnk
+
 # WorkBuddy 项目笔记（含本地环境信息）
 .workbuddy/

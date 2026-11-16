@@ -117,6 +117,35 @@ Windows 推荐直接双击 **`启动监听.bat`**（首次会自动建环境，�
 
 日志写在 `monitor.log`，已处理过的签到/通知记录在 `state.json`（可删除以重置）。
 
+### 图标与快捷方式
+
+`.bat` 文件在 Windows 里**没法单独设图标**（它跟所有 bat 共用同一个全局图标），所以图标挂在快捷方式上：
+
+| 文件 | 作用 |
+|---|---|
+| `chaoxing.ico` | 图标本体，内含 256/128/64/48/32/16 六种尺寸 |
+| `学习通监控.lnk` | 指向 `启动监听.bat` 的快捷方式，已套用上面的图标 |
+
+**双击 `学习通监控.lnk` 就等于双击 `启动监听.bat`**，只是多了学习通图标。想放到桌面或开机自启，直接把这个 `.lnk` 复制过去，图标会跟着走。
+
+`*.lnk` 里记录的是本机绝对路径，换电脑就失效，所以没放进仓库。到新机器后重新生成一次：
+
+```python
+pip install pylnk3
+```
+
+```python
+import os, pylnk3
+d = os.path.abspath(".")
+pylnk3.for_file(
+    os.path.join(d, "启动监听.bat"),
+    lnk_name=os.path.join(d, "学习通监控.lnk"),
+    description="学习通签到/通知实时监控告警器",
+    icon_file=os.path.join(d, "chaoxing.ico"),
+    work_dir=d,
+)
+```
+
 ### ⚠️ 让监控真正「一直在跑」（最容易翻车的地方）
 
 **监控不灵，九成是程序根本没在轮询。** 请注意这几点：
