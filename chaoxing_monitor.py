@@ -103,14 +103,17 @@ DEFAULT_CONFIG = {
     "webhook_url": "",
     "monitor_sign": True,
     "monitor_notice": True,
-    "auto_sign": True,
+    "auto_sign": False,
     "auto_sign_types": ["general", "photo", "location"],
     "location": "",
-    "sign_interval": 30,
-    "notice_interval": 180,
+    # 轮询频率是封号的直接原因：31 门课 × 每轮 1 次请求，
+    # 间隔 30 秒 = 每天 9 万次请求，实测 3 天内就会被学习通限流。
+    # 这里按「安全优先」给默认值，急用可自行调小，但要自己承担风险。
+    "sign_interval": 300,
+    "notice_interval": 900,
     "heartbeat_interval": 300,
     "course_refresh": 1800,
-    "sign_workers": 4,
+    "sign_workers": 1,
     "popup": True,
     "popup_seconds": 30,
     "sound": True,
